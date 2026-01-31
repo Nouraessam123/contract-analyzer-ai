@@ -1,0 +1,9 @@
+langchain
+langchain-huggingface
+chromadb
+pypdf
+python-docx
+sentence-transformers
+langchain==1.2.7
+langchain-core==1.2.7
+langchain-community==0.4.1
