@@ -1,52 +1,41 @@
 import streamlit as st
 import os
-import docx  # مكتبة التعامل مع ملفات الوورد
+import docx
+import shutil
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document # لتحويل نص الوورد لشكل يفهمه السيستم
+from langchain_core.documents import Document
 from dotenv import load_dotenv
-# 1. إعدادات الصفحة والـ CSS
-st.set_page_config(page_title="AI Legal Auditor", layout="wide")
 
+# 1. إعدادات الصفحة
+st.set_page_config(page_title="AI Legal Auditor", layout="wide")
+load_dotenv()
+
+# تحسين شكل الواجهة
 st.markdown("""
     <style>
     .stApp { background-color: #f8f9fa; }
-    h1, h2, h3 { color: #1e3d59; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-    .stButton>button {
-        width: 100%;
-        border-radius: 8px;
-        background-color: #1e3d59;
-        color: white;
-        font-weight: bold;
-        border: none;
-        height: 3em;
-    }
+    h1, h2, h3 { color: #1e3d59; font-family: 'Arial'; }
+    .stButton>button { width: 100%; border-radius: 8px; background-color: #1e3d59; color: white; height: 3em; font-weight: bold; }
     .stButton>button:hover { background-color: #ffc107; color: #1e3d59; border: 1px solid #1e3d59; }
+    .stAlert { border-radius: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
-# دالة مساعدة لقراءة ملفات الوورد
-def read_docx(file):
-    doc = docx.Document(file)
-    text = ""
-    for para in doc.paragraphs:
-        text += para.text + "\n"
-    # تحويل النص إلى تنسيق Document الخاص بـ LangChain
+# دالة قراءة الوورد
+def read_docx(file_path):
+    doc = docx.Document(file_path)
+    text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
     return [Document(page_content=text, metadata={"source": "uploaded_docx"})]
 
-st.title("⚖️ منصة تدقيق العقود الذكية")
-st.write("قم برفع العقد (PDF أو Word) للحصول على تحليل قانوني بميزان القانون المصري.")
-load_dotenv()
-# 2. تحميل النماذج
 @st.cache_resource
 def load_models():
     embeddings = HuggingFaceEmbeddings(model_name="./my_model")
     llm = ChatGroq(
         temperature=0, 
-        # التعديل هنا: اسم الباراميتر لازم يكون api_key
         api_key=os.getenv("GROQ_API_KEY"), 
         model_name="llama-3.3-70b-versatile"
     )
@@ -54,84 +43,103 @@ def load_models():
 
 embeddings, llm = load_models()
 
-# 3. رفع ومعالجة الملف (يدعم PDF و DOCX)
-uploaded_file = st.file_uploader("ارفع العقد", type=["pdf", "docx"])
+st.title("⚖️ منصة تدقيق العقود الذكية")
+st.write("حلل عقودك بدقة قانونية، اكتشف الثغرات، واضمن حقوقك بميزان القانون المصري.")
+
+uploaded_file = st.file_uploader("ارفع العقد (PDF أو DOCX)", type=["pdf", "docx"])
 
 if uploaded_file:
-    file_extension = uploaded_file.name.split('.')[-1].lower()
+    file_ext = uploaded_file.name.split('.')[-1].lower()
+    temp_path = f"temp_ui.{file_ext}"
     
-    with st.spinner(f"جاري معالجة ملف {file_extension.upper()}..."):
-        # حفظ ملف مؤقت للتعامل معه
-        with open(f"temp.{file_extension}", "wb") as f:
-            f.write(uploaded_file.getbuffer())
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    try:
+        # معالجة الملف
+        with st.spinner("جاري قراءة وتحليل المستند..."):
+            if file_ext == "pdf":
+                loader = PyPDFLoader(temp_path)
+                docs = loader.load()
+            else:
+                docs = read_docx(temp_path)
+
+        full_content = " ".join([d.page_content for d in docs])
         
-        # التبديل بين القارئ حسب نوع الملف
-        if file_extension == "pdf":
-            loader = PyPDFLoader("temp.pdf")
-            docs = loader.load()
-        else:
-            docs = read_docx(f"temp.docx")
+        # --- فحص صحة العقد (Validation) ---
+        legal_keywords = ["عقد", "بند", "طرف", "التزام", "اتفاق", "قانون", "صلاحية", "اختصاص", "contract", "agreement"]
+        is_legal = any(word in full_content.lower() for word in legal_keywords)
+
+        if not is_legal or len(full_content.strip()) < 150:
+            st.error("⚠️ المستند المرفق لا يبدو عقداً قانونياً معتمداً. يرجى رفع ملف يحتوي على بنود قانونية واضحة.")
+            st.stop()
         
-        # تقسيم النص
+        # تقسيم النص وإنشاء المستودع الرقمي
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         splits = text_splitter.split_documents(docs)
-        
-        # إنشاء الـ Vector Store
         vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-
-    # 4. دالة التحليل الذكية
-    def run_legal_task(task_instruction, use_table=False):
-        relevant_docs = retriever.invoke(task_instruction)
-        context = "\n\n".join([doc.page_content for doc in relevant_docs])
         
-        table_instruction = "برجاء عرض النتائج في شكل جدول Markdown منظم (البند | التفاصيل)." if use_table else ""
+        # زيادة k لـ 6 لضمان تحليل شامل للمخاطر
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
 
-        full_prompt = f"""أنت مستشار قانوني مصري خبير. استخدم المعلومات التالية فقط لتحليل العقد وفقاً لأصول القانون المصري.
+        # دالة المهام الذكية
+        def run_legal_task(task_instruction, use_table=False):
+            relevant_docs = retriever.invoke(task_instruction)
+            context = "\n\n".join([doc.page_content for doc in relevant_docs])
+            
+            table_info = "برجاء عرض النتائج في شكل جدول Markdown منظم." if use_table else ""
+
+            # الـ Prompt التحليلي المطور
+            full_prompt = f"""أنت مستشار قانوني مصري خبير وشديد الذكاء. 
+            مهمتك: تحليل النص المرفق والإجابة على سؤال المستخدم بدقة وقوة قانونية.
+
+            قواعد العمل:
+            1. استخدم السياق المرفق لتحليل المخاطر، الثغرات، والالتزامات.
+            2. في حالة الأسئلة التحليلية (مثل المخاطر)، قم باستنتاج التبعات القانونية بناءً على نصوص العقد والقانون المصري.
+            3. إذا وجدت بنداً غامضاً أو معلومة ناقصة (مثل غياب تاريخ الانتهاء أو شروط الفسخ)، وضح ذلك فوراً كخطر محتمل.
+            4. الإجابة بالعربية الفصحى فقط، وبأسلوب قانوني رصين.
+            5. ممنوع استخدام أي لغة غير العربية في الإجابة.
+
+            السياق المستخرج:
+            {context}
+
+            المهمة المطلوبة: {task_instruction}
+            {table_info}
+
+            الإجابة التحليلية:"""
+            
+            with st.spinner("جاري الفحص القانوني..."):
+                response = llm.invoke(full_prompt)
+                return response.content
+
+        # عرض الواجهة
+        st.success("✅ تم التعرف على المستند بنجاح. يمكنك الآن البدء بالتدقيق.")
         
-        المعلومات المستخرجة:
-        {context}
-        
-        المهمة: {task_instruction}
-        {table_instruction}
-        
-        قواعد الإجابة:
-        1. الإجابة بالعربية الفصحى فقط.
-        2. ادخل في الموضوع مباشرة بدون مقدمات.
-        3. كن دقيقاً جداً في استخراج الالتزامات والثغرات القانونية."""
-        
-        with st.spinner("يتم الآن الفحص القانوني..."):
-            response = llm.invoke(full_prompt)
-            return response.content
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("📝 ملخص العقد"):
+                res = run_legal_task("لخص أهم بنود العقد (الأطراف، القيمة، المدة، وطبيعة العمل).", True)
+                st.markdown(res)
+        with col2:
+            if st.button("🚨 كشف المخاطر"):
+                res = run_legal_task("استخرج أي ثغرات قانونية أو مخاطر محتملة في هذا العقد بناءً على بنود الفسخ والتعويضات.")
+                st.warning(res)
+        with col3:
+            if st.button("💰 الالتزامات"):
+                res = run_legal_task("ما هي الالتزامات المالية، طرق الدفع، والجزاءات المذكورة؟", True)
+                st.info(res)
 
-    # 5. عرض الخيارات
-    st.write("---")
-    st.subheader("إجراءات سريعة:")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if st.button("📝 ملخص العقد"):
-            res = run_legal_task("لخص أهم 5 بنود في العقد (الأطراف، المدة، القيمة، الغرض، الفسخ).", use_table=True)
-            st.markdown(res)
+        st.divider()
+        st.subheader("💬 اسأل المستشار القانوني")
+        user_query = st.text_input("اسأل عن أي بند محدد (مثلاً: ما هو موقف الطرف الثاني في حالة القوة القاهرة؟)")
+        if user_query:
+            answer = run_legal_task(user_query)
+            st.chat_message("assistant").write(answer)
 
-    with col2:
-        if st.button("🚨 كشف المخاطر"):
-            res = run_legal_task("استخرج الثغرات القانونية والمخاطر المحتملة حسب القانون المصري في شكل نقاط واضحة.")
-            st.warning(res)
-
-    with col3:
-        if st.button("💰 الالتزامات"):
-            res = run_legal_task("ما هي الالتزامات المالية والجدول الزمني المذكور؟", use_table=True)
-            st.success(res)
-
-    # 6. قسم الدردشة
-    st.divider()
-    st.subheader("💬 اسأل المستشار القانوني")
-    user_query = st.text_input("مثلاً: ما هي شروط فسخ هذا العقد؟")
-    if user_query:
-        answer = run_legal_task(user_query)
-        st.write("**الرد القانوني:**")
-        st.write(answer)
-
+    except Exception as e:
+        st.error(f"حدث خطأ أثناء المعالجة: {e}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 else:
-    st.info("💡 **جاهز للبدء:** ارفع عقدك الآن بصيغة **PDF** أو **Word**، وسيقوم المستشار الذكي باستخراج الثغرات والالتزامات في ثوانٍ.")
+    st.info("💡 **نصيحة:** ارفع عقداً واضحاً بصيغة PDF أو Word للحصول على أدق تحليل قانوني.")

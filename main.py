@@ -1,8 +1,16 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import os
 import docx
 import shutil
+import json
+import re
+import uuid
+import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -10,89 +18,271 @@ from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from typing import Dict
 
-# تحميل المفاتيح من .env
+# Logging setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 app = FastAPI(title="Legal AI Auditor API")
 
-# إعداد الـ CORS عشان الـ Front-end (React/Vue) يقدر يكلم الـ API بدون مشاكل أمنية
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # في الإنتاج بنحدد دومين الموقع فقط
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# تحميل النماذج (Embeddings & LLM)
+# Cache: analysis_id → (vectorstore, expiry_time)
+vectorstore_cache: Dict[str, tuple[Chroma, datetime]] = {}
+
 embeddings = HuggingFaceEmbeddings(model_name="./my_model")
 llm = ChatGroq(
-    temperature=0, 
-    api_key=os.getenv("GROQ_API_KEY"), 
+    temperature=0,
+    api_key=os.getenv("GROQ_API_KEY"),
     model_name="llama-3.3-70b-versatile"
 )
 
-# دالة مساعدة لقراءة ملفات الوورد
-def read_docx(file_path):
+def read_docx(file_path: str):
     doc = docx.Document(file_path)
     text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
     return [Document(page_content=text)]
 
-@app.get("/")
-def read_root():
-    return {"status": "Online", "message": "Legal AI Auditor API is running"}
-
-@app.post("/analyze")
-async def analyze_contract(
-    file: UploadFile = File(...), 
-    query: str = Form(...)
-):
-    # 1. التأكد من نوع الملف
+async def create_vectorstore(file: UploadFile, collection_name: str) -> Chroma:
     file_ext = file.filename.split('.')[-1].lower()
     if file_ext not in ["pdf", "docx"]:
-        raise HTTPException(status_code=400, detail="Only PDF and DOCX are supported")
+        raise HTTPException(400, "برجاء رفع ملف PDF أو DOCX فقط.")
 
-    # 2. حفظ الملف مؤقتاً لمعالجته
-    temp_path = f"temp_api.{file_ext}"
+    temp_path = f"temp_{uuid.uuid4()}.{file_ext}"
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        # 3. استخراج النص بناءً على النوع
         if file_ext == "pdf":
             loader = PyPDFLoader(temp_path)
             docs = loader.load()
         else:
             docs = read_docx(temp_path)
 
-        # 4. معالجة النص (Split & Vectorize)
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        full_content = " ".join(d.page_content for d in docs)
+        if len(full_content.strip()) < 50:
+            raise HTTPException(400, "المستند فارغ جداً أو لا يمكن قراءته.")
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
         splits = text_splitter.split_documents(docs)
-        
-        # إنشاء مخزن مؤقت (في الرامات لسرعة الـ API)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-        # 5. البحث عن السياق وسؤال الـ AI
-        relevant_docs = retriever.invoke(query)
-        context = "\n\n".join([d.page_content for d in relevant_docs])
+        vectorstore = Chroma.from_documents(
+            documents=splits,
+            embedding=embeddings,
+            collection_name=collection_name
+        )
+        return vectorstore
 
-        full_prompt = f"""أنت مستشار قانوني مصري. بناءً على السياق التالي، أجب على السؤال بدقة وقوة قانونية.
-        السياق: {context}
-        السؤال: {query}
-        الإجابة بالعربية الفصحى:"""
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+def cleanup_cache():
+    now = datetime.now()
+    to_delete = []
+    for analysis_id, (vectorstore, expiry) in vectorstore_cache.items():
+        if now > expiry:
+            to_delete.append(analysis_id)
+            try:
+                vectorstore.delete_collection()
+                logger.info(f"[CLEANUP] Deleted collection for expired analysis_id: {analysis_id}")
+            except Exception as e:
+                logger.warning(f"[CLEANUP] Failed to delete collection for {analysis_id}: {str(e)}")
+
+    for aid in to_delete:
+        del vectorstore_cache[aid]
+
+@app.post("/analyze")
+@limiter.limit("10/minute")
+async def analyze_contract(request: Request, file: UploadFile = File(...), history: str = Form("[]")):
+    cleanup_cache()
+    analysis_id = str(uuid.uuid4())
+    collection_name = f"contract_{analysis_id.replace('-', '_')[:20]}"
+
+    try:
+        vectorstore = await create_vectorstore(file, collection_name)
+        expiry = datetime.now() + timedelta(hours=1)
+        vectorstore_cache[analysis_id] = (vectorstore, expiry)
+        logger.info(f"[ANALYZE] Vectorstore cached for {analysis_id} until {expiry}")
+
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+
+        try:
+            chat_history = json.loads(history)
+            history_text = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in chat_history)
+        except:
+            history_text = ""
+
+        context_docs = retriever.invoke("استخرج نوع العقد والأطراف والمخاطر الرئيسية والالتزامات الجوهرية")
+        context = "\n\n".join(d.page_content for d in context_docs)
+        if len(context) > 8000:
+            context = context[:8000] + "\n[تم تقصير السياق]"
+
+        full_prompt = f"""أنت مستشار قانوني مصري خبير. حلل العقد بناءً على السياق المقدم فقط.
+
+قواعد صارمة:
+- لا تستخدم أي معرفة خارج السياق أبدًا.
+- حدد نوع العقد بدقة من العنوان أو المقدمة أو العبارات الصريحة فقط.
+- إذا لم يكن النوع واضحًا صراحة، اكتب "غير محدد بوضوح في النص".
+- رتب المخاطر من الأشد خطورة إلى الأقل.
+- صنف كل خطر: "high" أو "medium" أو "low".
+- ابدأ الرد مباشرة بالـ {{ بدون أي كلمة أو مسافة قبلها.
+- لا تضيف أي نص بعد الـ }} الختامي.
+- لا تضع تعليقات أو // داخل الـ JSON.
+- ضمن أن الـ JSON صالح 100%.
+
+الصيغة المطلوبة:
+{{
+  "contract_type": "نوع العقد",
+  "summary": "ملخص موجز 60-120 كلمة",
+  "risks": [
+    {{"level": "high", "description": "الوصف مع السبب", "reference": "البند أو الفقرة"}},
+    ...
+  ],
+  "obligations": {{
+    "الطرف_الأول": ["التزام 1", "التزام 2"],
+    "الطرف_الثاني": [...]
+  }},
+  "comparison_table": [
+    ["البند", "شروط الطرف الأول", "شروط الطرف الثاني"],
+    ["...", "...", "..."]
+  ]
+}}
+
+السياق المستخرج من العقد:
+{context}
+
+تاريخ المحادثة:
+{history_text}
+
+الإجابة (ابدأ مباشرة بالـ JSON):"""
 
         response = llm.invoke(full_prompt)
-        
+        content = response.content.strip()
+
+        logger.info(f"[ANALYZE] Raw LLM response:\n{content[:800]}...")
+
+        start = content.find('{')
+        end = content.rfind('}') + 1
+        if start == -1 or end <= start:
+            raise ValueError("لم يتم العثور على { أو } في الرد")
+
+        json_str = content[start:end]
+        analysis_dict = json.loads(json_str)
+
         return {
+            "analysis_id": analysis_id,
             "filename": file.filename,
-            "query": query,
-            "answer": response.content
+            "analysis": analysis_dict,
+            "status": "success"
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # مسح الملف المؤقت بعد الانتهاء
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        logger.exception(f"[ANALYZE] Error: {str(e)}")
+        raise HTTPException(500, f"خطأ أثناء التحليل: {str(e)}")
+
+@app.post("/chat")
+@limiter.limit("20/minute")
+async def chat_with_contract(request: Request, data: Dict = Body(...)):
+    cleanup_cache()
+    analysis_id = data.get("analysis_id")
+    query = data.get("query")
+    history = data.get("history", [])
+
+    if not analysis_id or not query:
+        raise HTTPException(400, "analysis_id و query مطلوبين")
+
+    logger.info(f"[CHAT] طلب جديد → analysis_id: {analysis_id} | السؤال: {query[:100]}")
+
+    if analysis_id not in vectorstore_cache:
+        logger.warning(f"[CHAT] الـ analysis_id مش موجود في الكاش: {analysis_id}")
+        raise HTTPException(404, "الـ analysis_id غير موجود أو انتهت صلاحيته. ارفعي العقد من جديد.")
+
+    try:
+        vectorstore, expiry = vectorstore_cache[analysis_id]
+        logger.info(f"[CHAT] تم العثور على vectorstore لـ {analysis_id} (ينتهي في {expiry})")
+
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 12})  # زودنا شوية عشان نجيب سياق أكبر
+        logger.info("[CHAT] تم إنشاء retriever بنجاح")
+
+        context_docs = retriever.invoke(query)
+        logger.info(f"[CHAT] تم استرجاع {len(context_docs)} جزء/قطعة من العقد")
+
+        context = "\n\n".join(d.page_content for d in context_docs)
+        if len(context) > 10000:
+            context = context[:10000] + "\n[تم تقصير السياق للحد الأقصى]"
+
+        history_text = json.dumps(history, ensure_ascii=False, indent=2)
+
+        full_prompt = f"""أنت مستشار قانوني مصري خبير بالقوانين المصرية.
+
+القواعد الصارمة التي يجب اتباعها بدون استثناء:
+1. ابدأ ردك مباشرة بالـ JSON بدون أي كلمة أو مسافة أو سطر قبل العلامة {{
+2. لا تضع أي نص بعد الـ }} الختامي للـ JSON.
+3. لا تضع تعليقات داخل الـ JSON (مثل // أو /* */).
+4. ضمن أن الـ JSON صالح نحويًا 100%: كل المفاتيح والقيم النصية داخل "" مزدوجة، والقوائم والكائنات صحيحة.
+
+ترتيب الأولوية في الإجابة:
+- أولاً: ابحث في "السياق المستخرج من العقد" وابحث عن إجابة واضحة أو مباشرة.
+  → إذا وجدت → أجب بناءً عليها فقط واذكر المرجع إن وجد (مثل: حسب البند ٥.٢).
+- ثانيًا: إذا لم تجد إجابة واضحة في السياق → استخدم معرفتك بالقانون المصري (مثل قانون العمل رقم ١٢ لسنة ٢٠٠٣، أو القانون المدني، أو غيره) لتقديم إجابة منطقية، لكن يجب أن تذكر صراحة في الإجابة: "غير مذكور في العقد، ولكن حسب القانون المصري..."
+- ثالثًا: إذا لم يكن هناك أي أساس عقدي أو قانوني واضح → أجب فقط بـ: "لا توجد معلومات كافية في العقد ولا في القانون المعروف لهذا السؤال."
+
+أجب دائمًا بهذا الشكل فقط:
+{{
+  "answer": "الإجابة الكاملة والدقيقة هنا (قد تكون فقرة أو أكثر)"
+}}
+
+السياق المستخرج من العقد:
+{context}
+
+تاريخ المحادثة السابقة:
+{history_text}
+
+السؤال الحالي: {query}
+
+الإجابة (ابدأ مباشرة بالـ JSON):"""
+
+        logger.info("[CHAT] جاري إرسال الـ prompt للنموذج...")
+        response = llm.invoke(full_prompt)
+        content = response.content.strip()
+
+        logger.info(f"[CHAT] رد النموذج الخام: {content[:500]}...")
+
+        # استخراج JSON بطريقة أكثر مرونة
+        start = content.find('{')
+        end = content.rfind('}') + 1
+        if start == -1 or end <= start:
+            logger.error("[CHAT] ما لقيناش { أو } في الرد")
+            return {"status": "error", "message": "لم يتم العثور على JSON في رد النموذج"}
+
+        json_str = content[start:end]
+        try:
+            resp_dict = json.loads(json_str)
+            answer = resp_dict.get("answer", "")
+            if not answer.strip():
+                answer = "لا توجد معلومات كافية في العقد"
+            logger.info("[CHAT] تم استخراج الإجابة بنجاح")
+            return {"answer": answer, "status": "success"}
+        except json.JSONDecodeError as e:
+            logger.error(f"[CHAT] خطأ في تحليل JSON: {str(e)}\nالنص المستخرج: {json_str[:300]}...")
+            return {"status": "error", "message": f"خطأ في تحليل رد النموذج: {str(e)}"}
+
+    except Exception as e:
+        logger.exception(f"[CHAT] خطأ غير متوقع لـ analysis_id {analysis_id}")
+        raise HTTPException(500, f"خطأ داخلي في الدردشة: {str(e)}. شوفي logs السيرفر.")
+@app.get("/")
+async def root():
+    return {"status": "online"}
